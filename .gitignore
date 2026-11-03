@@ -1,0 +1,16 @@
+# Never commit secrets
+.env
+*.env
+!.env.example
+
+# Runtime data
+jobagent/state/*
+!jobagent/state/.keep
+jobagent/output/*
+!jobagent/output/.keep
+
+# Python / OS clutter
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
