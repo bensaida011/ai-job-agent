@@ -1,0 +1,51 @@
+# Jobs stack: NocoDB (job tracker, required).
+# n8n and Gotenberg are optional extras for future parts of the project:
+#   start only NocoDB:        docker compose up -d
+#   start NocoDB + extras:    docker compose --profile extras up -d
+services:
+  nocodb:
+    image: nocodb/nocodb:latest
+    container_name: nocodb
+    restart: unless-stopped
+    ports:
+      - "8081:8080"
+    volumes:
+      - nocodb:/usr/app/data
+    networks:
+      - shared
+
+  n8n:                              # optional (profile "extras")
+    image: docker.n8n.io/n8nio/n8n
+    container_name: n8n
+    profiles: ["extras"]
+    restart: unless-stopped
+    ports:
+      - "5678:5678"
+    environment:
+      - GENERIC_TIMEZONE=Europe/London
+      - TZ=Europe/London
+      - N8N_SECURE_COOKIE=false     # allows plain http on a private network only
+      - N8N_RUNNERS_ENABLED=true
+      - WEBHOOK_URL=${N8N_WEBHOOK_URL:-http://localhost:5678/}
+      - NODE_FUNCTION_ALLOW_BUILTIN=*
+    volumes:
+      - n8n:/home/node/.n8n
+      - /opt/jobagent:/data
+    networks:
+      - shared
+
+  gotenberg:                        # optional (profile "extras"): HTML -> PDF, internal only
+    image: gotenberg/gotenberg:8
+    container_name: gotenberg
+    profiles: ["extras"]
+    restart: unless-stopped
+    networks:
+      - shared
+
+volumes:
+  nocodb:
+  n8n:
+
+networks:
+  shared:
+    external: true

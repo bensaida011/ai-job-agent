@@ -1,0 +1,15 @@
+# Job Finder stack. Start with:  cd /opt/stacks/jobagent && docker compose up -d --build
+services:
+  jobagent:
+    build: .
+    container_name: jobagent
+    restart: unless-stopped
+    env_file: .env              # all secrets live here (chmod 600)
+    volumes:
+      - /opt/jobagent:/data     # app, cv, state and output folders
+    networks:
+      - shared
+
+networks:
+  shared:
+    external: true              # created by the AI stack (/opt/stacks/ai)

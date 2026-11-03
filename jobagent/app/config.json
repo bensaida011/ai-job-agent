@@ -1,0 +1,35 @@
+{
+  "run_times": ["07:30", "18:30"],
+  "search_keywords": [
+    "SOC Analyst",
+    "Security Operations Analyst",
+    "Cyber Security Analyst",
+    "Information Security Analyst",
+    "Graduate Cyber Security",
+    "Junior Penetration Tester",
+    "Digital Forensics",
+    "IT Security",
+    "Systems Administrator",
+    "IT Support Analyst"
+  ],
+  "location": "",
+  "distance_miles": 20,
+  "title_must_contain_one_of": [
+    "SOC", "Security", "Cyber", "Forensic", "Penetration", "Pen Test",
+    "Analyst", "Systems Administrator", "Sysadmin", "IT Support", "Infrastructure"
+  ],
+  "avoid_title_keywords": [
+    "Senior", "Sr", "Lead", "Principal", "Head", "Manager", "Director",
+    "Architect", "Chief", "VP"
+  ],
+  "skip_if_description_contains": [
+    "SC clearance", "DV clearance", "SC cleared", "DV cleared",
+    "security clearance is required",
+    "unable to sponsor", "cannot sponsor", "will not sponsor", "no sponsorship",
+    "British citizens only", "UK nationals only"
+  ],
+  "max_days_old": 3,
+  "max_jobs_to_score_per_run": 40,
+  "min_match_score": 70,
+  "telegram_top_n": 15
+}

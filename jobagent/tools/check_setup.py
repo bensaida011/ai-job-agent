@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+"""
+Helper: test every connection the Job Finder needs, one by one.
+
+Run (on the server):
+  docker exec jobagent python /data/tools/check_setup.py
+
+Each line ends in OK, SKIP or FAIL with a hint. Add --send to also send a
+test message to your Telegram. Secrets are never printed.
+"""
+import json
+import os
+import sys
+
+import requests
+
+E = os.environ.get
+DATA = E("DATA_DIR", "/data")
+REED_BASE = E("REED_BASE_URL", "https://www.reed.co.uk/api/1.0").rstrip("/")
+ADZUNA_BASE = E("ADZUNA_BASE_URL", "https://api.adzuna.com/v1/api").rstrip("/")
+TG_BASE = E("TELEGRAM_API_BASE", "https://api.telegram.org").rstrip("/")
+failures = 0
+
+
+def is_set(name):
+    v = (E(name) or "").strip()
+    return bool(v) and "YOUR_" not in v
+
+
+def report(name, status, hint=""):
+    global failures
+    if status == "FAIL":
+        failures += 1
+    print(f"  {name:<22} {status:<5} {hint}")
+
+
+def check(name, func):
+    try:
+        status, hint = func()
+    except requests.RequestException as exc:
+        status, hint = "FAIL", f"cannot connect ({type(exc).__name__})"
+    except Exception as exc:
+        status, hint = "FAIL", str(exc)[:120]
+    report(name, status, hint)
+
+
+def files():
+    for rel in ("app/config.json", "cv/master.md"):
+        if not os.path.isfile(os.path.join(DATA, rel)):
+            return "FAIL", f"missing {rel} in /opt/jobagent"
+    with open(os.path.join(DATA, "app/config.json"), encoding="utf-8") as f:
+        cfg = json.load(f)
+    with open(os.path.join(DATA, "cv/master.md"), encoding="utf-8") as f:
+        words = len(f.read().split())
+    hint = f"{len(cfg.get('search_keywords', []))} keywords, master.md {words} words"
+    return "OK", hint
+
+
+def reed():
+    if not is_set("REED_API_KEY"):
+        return "FAIL", "REED_API_KEY not set in .env"
+    r = requests.get(f"{REED_BASE}/search", params={"keywords": "analyst", "resultsToTake": 1},
+                     auth=(E("REED_API_KEY").strip(), ""), timeout=30)
+    if r.status_code == 401:
+        return "FAIL", "key rejected (401): copy it again from the Reed email"
+    r.raise_for_status()
+    return "OK", f"{r.json().get('totalResults', '?')} jobs available"
+
+
+def adzuna():
+    if not (is_set("ADZUNA_APP_ID") and is_set("ADZUNA_APP_KEY")):
+        return "SKIP", "not configured (optional)"
+    r = requests.get(f"{ADZUNA_BASE}/jobs/gb/search/1",
+                     params={"app_id": E("ADZUNA_APP_ID").strip(),
+                             "app_key": E("ADZUNA_APP_KEY").strip(),
+                             "what": "analyst", "results_per_page": 1}, timeout=30)
+    if r.status_code in (401, 403):
+        return "FAIL", "rejected: APP_ID must be the short 8-character id"
+    r.raise_for_status()
+    return "OK", f"{r.json().get('count', '?')} jobs available"
+
+
+def ollama():
+    url = E("OLLAMA_URL", "http://ollama:11434").rstrip("/")
+    model = E("SCORING_MODEL", "qwen2.5:3b")
+    r = requests.get(f"{url}/api/tags", timeout=15)
+    r.raise_for_status()
+    names = [m.get("name", "") for m in r.json().get("models", [])]
+    if model not in names and f"{model}:latest" not in names:
+        return "FAIL", f"model {model} not downloaded: docker exec ollama ollama pull {model}"
+    return "OK", f"{model} is installed"
+
+
+def nocodb():
+    if not (is_set("NOCODB_TOKEN") and is_set("NOCODB_TABLE_ID")):
+        return "FAIL", "NOCODB_TOKEN or NOCODB_TABLE_ID not set in .env"
+    url = E("NOCODB_URL", "http://nocodb:8080").rstrip("/")
+    r = requests.get(f"{url}/api/v2/tables/{E('NOCODB_TABLE_ID').strip()}/records",
+                     headers={"xc-token": E("NOCODB_TOKEN").strip()},
+                     params={"limit": 1}, timeout=15)
+    if r.status_code in (401, 403):
+        return "FAIL", "token rejected: create a new API token in NocoDB"
+    if r.status_code == 404:
+        return "FAIL", "table not found: check NOCODB_TABLE_ID"
+    r.raise_for_status()
+    return "OK", "tracker table reachable"
+
+
+def telegram():
+    if not (is_set("TELEGRAM_TOKEN") and is_set("TELEGRAM_CHAT_ID")):
+        return "FAIL", "TELEGRAM_TOKEN or TELEGRAM_CHAT_ID not set in .env"
+    base = f"{TG_BASE}/bot{E('TELEGRAM_TOKEN').strip()}"
+    r = requests.get(f"{base}/getMe", timeout=30)
+    if r.status_code == 401:
+        return "FAIL", "token rejected: copy it again from @BotFather"
+    r.raise_for_status()
+    bot = r.json().get("result", {}).get("username", "?")
+    if "--send" in sys.argv:
+        s = requests.post(f"{base}/sendMessage",
+                          json={"chat_id": E("TELEGRAM_CHAT_ID").strip(),
+                                "text": "Job agent online - test message"}, timeout=30)
+        if s.status_code == 400:
+            return "FAIL", "bot works but chat ID is wrong, or you never pressed Start"
+        s.raise_for_status()
+        return "OK", f"bot @{bot}; test message sent"
+    return "OK", f"bot @{bot} (add --send to send a test message)"
+
+
+print("AI Job Agent - setup check")
+check("Files", files)
+check("Reed API", reed)
+check("Adzuna API", adzuna)
+check("Ollama + model", ollama)
+check("NocoDB tracker", nocodb)
+check("Telegram", telegram)
+print("All required checks passed." if failures == 0 else f"{failures} check(s) failed - see hints above.")
+sys.exit(1 if failures else 0)
