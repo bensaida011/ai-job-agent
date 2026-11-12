@@ -6,8 +6,9 @@
 
 **Download the install package:** [ai-job-agent.zip (latest release)](../../releases/latest)
 
-A self-hosted assistant that searches job boards (UK via Reed + Adzuna, other
-countries such as Poland via Adzuna) twice a day, scores every
+A self-hosted assistant that searches job boards (UK via Reed + Adzuna; Poland
+via Adzuna plus the free solid.jobs API; remote roles via the Himalayas API)
+twice a day, scores every
 advert against your own profile with an AI model, saves the good matches
 to a tracker and sends you a Telegram summary.
 
@@ -51,7 +52,7 @@ ai-job-agent/
     ├── cv/master.md            YOUR true profile (template - replace it)
     ├── cv/answers.yaml         YOUR fixed form answers (for planned part 4)
     ├── tools/get_chat_id.py    prints your Telegram chat ID
-    ├── tools/check_setup.py    tests Reed, Adzuna, Ollama, NocoDB, Telegram
+    ├── tools/check_setup.py    tests Reed, Adzuna, solid.jobs, Himalayas, AI, NocoDB, Telegram
     ├── state/                  seen.json + run.log are created here
     └── output/                 reserved for tailored CVs (planned part 2)
 ```

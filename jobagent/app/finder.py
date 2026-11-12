@@ -7,7 +7,9 @@ What this program does, in order:
 
   1. Waits until one of the times listed in config.json -> "run_times"
      (or runs immediately when started with --once).
-  2. Downloads fresh job adverts from the Reed and Adzuna job APIs.
+  2. Downloads fresh job adverts from Reed (UK), Adzuna (many countries,
+     including Poland) and the free solid.jobs and Himalayas APIs
+     (Polish IT board and remote roles).
   3. Removes duplicates and adverts it has already processed before.
   4. Throws away adverts that clearly do not fit (wrong title, too senior,
      or containing a "skip" phrase such as a security-clearance requirement).
@@ -71,6 +73,8 @@ MISTRAL_BASE = os.environ.get("MISTRAL_BASE_URL", "https://api.mistral.ai").rstr
 # Base URLs can be overridden for testing; normal users never change these.
 REED_BASE = os.environ.get("REED_BASE_URL", "https://www.reed.co.uk/api/1.0").rstrip("/")
 ADZUNA_BASE = os.environ.get("ADZUNA_BASE_URL", "https://api.adzuna.com/v1/api").rstrip("/")
+SOLID_BASE = os.environ.get("SOLID_BASE_URL", "https://solid.jobs").rstrip("/")
+HIMALAYAS_BASE = os.environ.get("HIMALAYAS_BASE_URL", "https://himalayas.app").rstrip("/")
 TELEGRAM_BASE = os.environ.get("TELEGRAM_API_BASE", "https://api.telegram.org").rstrip("/")
 
 # AI scoring limits (explained in the handbook, chapter "AI configuration")
@@ -101,6 +105,10 @@ def load_config():
         cfg = json.load(f)
     cfg.setdefault("run_times", ["07:30", "18:30"])
     cfg.setdefault("search_keywords", [])
+    cfg.setdefault("search_countries", [])
+    cfg.setdefault("solidjobs_enabled", True)
+    cfg.setdefault("solidjobs_campaign", "ai-job-agent")
+    cfg.setdefault("himalayas_enabled", True)
     cfg.setdefault("location", "")
     cfg.setdefault("distance_miles", 20)
     cfg.setdefault("title_must_contain_one_of", [])
@@ -163,6 +171,14 @@ def parse_reed_date(value):
     try:
         return dt.datetime.strptime(value, "%d/%m/%Y").date()
     except (TypeError, ValueError):
+        return None
+
+
+def parse_iso_date(value):
+    """Parse ISO dates like '2026-11-12T16:55:10.78+01:00' into a date."""
+    try:
+        return dt.datetime.fromisoformat((value or "")[:19]).date()
+    except ValueError:
         return None
 
 
@@ -284,6 +300,114 @@ def fetch_reed_details(job):
     except Exception as exc:
         log(f"Reed details failed for {job['id']}: {exc} (using snippet)")
     return job
+
+
+def fetch_solidjobs(cfg):
+    """solid.jobs - Polish IT board with a free, keyless public API.
+
+    The 'campaign' parameter is not a secret: the API asks integrators to
+    send a name identifying their service, purely for traffic statistics.
+    """
+    countries = search_countries(cfg)
+    if not any((c.get("code") or "gb").lower() == "pl" for c in countries):
+        log("solid.jobs: PL not in search_countries, skipping solid.jobs")
+        return []
+    if not cfg.get("solidjobs_enabled", True):
+        log("solid.jobs: disabled (solidjobs_enabled = false), skipping")
+        return []
+    campaign = re.sub(r"[^a-z0-9-]+", "-",
+                      str(cfg.get("solidjobs_campaign") or "ai-job-agent")
+                      .lower()).strip("-")[:64]
+    pl = [c for c in countries if (c.get("code") or "gb").lower() == "pl"][0]
+    oldest = dt.date.today() - dt.timedelta(days=int(cfg["max_days_old"]))
+    jobs = []
+    for keyword in cfg["search_keywords"]:
+        params = {"campaign": campaign, "search.searchTerm": keyword,
+                  "pageIndex": 0, "pageSize": 100}
+        if pl.get("location"):
+            params["search.cities"] = pl["location"]
+        try:
+            r = requests.get(f"{SOLID_BASE}/public-api/offers/IT", params=params,
+                             headers={"X-Api-Version": "1.0"}, timeout=HTTP_TIMEOUT)
+            r.raise_for_status()
+            results = r.json().get("jobs", [])
+        except Exception as exc:
+            log(f"solid.jobs: '{keyword}' failed: {exc}")
+            continue
+        kept = 0
+        for item in results:
+            posted = parse_iso_date(item.get("validFrom"))
+            if posted and posted < oldest:
+                continue
+            location = ", ".join(item.get("locations") or [])
+            if item.get("isRemote"):
+                location = f"{location}, remote" if location else "Remote"
+            jobs.append({
+                "id": f"solid-{item.get('jobOfferKey')}",
+                "source": "solid.jobs",
+                "source_job_id": item.get("jobOfferKey"),
+                "country": "PL",
+                "title": item.get("title") or "",
+                "company": item.get("company") or "",
+                "location": location,
+                "url": item.get("url") or "",
+                "description": strip_html(item.get("description") or ""),
+            })
+            kept += 1
+        log(f"solid.jobs: '{keyword}' -> {len(results)} results, {kept} fresh")
+    return jobs
+
+
+def fetch_himalayas(cfg):
+    """Himalayas - free public API for remote jobs, filterable by country.
+
+    Their data refreshes every 24 hours, so one call per run is enough.
+    """
+    if not cfg.get("himalayas_enabled", True):
+        log("Himalayas: disabled (himalayas_enabled = false), skipping")
+        return []
+    oldest = dt.date.today() - dt.timedelta(days=int(cfg["max_days_old"]))
+    jobs = []
+    for keyword in cfg["search_keywords"]:
+        for country in search_countries(cfg):
+            code = (country.get("code") or "gb").upper()
+            params = {"q": keyword, "country": code,
+                      "sort": "recent", "limit": 20}
+            try:
+                r = requests.get(f"{HIMALAYAS_BASE}/jobs/api/search", params=params,
+                                 timeout=HTTP_TIMEOUT)
+                r.raise_for_status()
+                results = r.json().get("jobs", [])
+            except Exception as exc:
+                log(f"Himalayas [{code}]: '{keyword}' failed: {exc}")
+                continue
+            kept = 0
+            for item in results:
+                posted = None
+                if item.get("pubDate"):
+                    try:
+                        posted = dt.date.fromtimestamp(int(item["pubDate"]))
+                    except (ValueError, OSError):
+                        posted = None
+                if posted and posted < oldest:
+                    continue
+                restrictions = item.get("locationRestrictions") or []
+                location = (f"Remote, {', '.join(restrictions)}"
+                            if restrictions else "Remote (worldwide)")
+                jobs.append({
+                    "id": f"himalayas-{item.get('guid')}",
+                    "source": "Himalayas",
+                    "source_job_id": item.get("guid"),
+                    "country": code,
+                    "title": item.get("title") or "",
+                    "company": item.get("companyName") or "",
+                    "location": location,
+                    "url": item.get("applicationLink") or "",
+                    "description": strip_html(item.get("description") or ""),
+                })
+                kept += 1
+            log(f"Himalayas [{code}]: '{keyword}' -> {len(results)} results, {kept} fresh")
+    return jobs
 
 
 # ---------------------------------------------------------------------------
@@ -522,7 +646,8 @@ def run_once():
     log(f"Run started (AI_PROVIDER {AI_PROVIDER}, model {SCORING_MODEL}, "
         f"threshold {cfg['min_match_score']})")
 
-    jobs = dedupe(fetch_reed(cfg) + fetch_adzuna(cfg))
+    jobs = dedupe(fetch_reed(cfg) + fetch_adzuna(cfg)
+                  + fetch_solidjobs(cfg) + fetch_himalayas(cfg))
     fetched = len(jobs)
     jobs = [j for j in jobs if j["id"] not in seen]
     log(f"Fetched {fetched} unique jobs, {len(jobs)} not seen before")

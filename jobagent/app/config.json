@@ -12,8 +12,13 @@
     "Systems Administrator",
     "IT Support Analyst"
   ],
-  "location": "",
-  "distance_miles": 20,
+  "search_countries": [
+    {"code": "gb", "location": "", "distance_miles": 20},
+    {"code": "pl", "location": "", "distance_miles": 20}
+  ],
+  "solidjobs_enabled": true,
+  "solidjobs_campaign": "ai-job-agent",
+  "himalayas_enabled": true,
   "title_must_contain_one_of": [
     "SOC", "Security", "Cyber", "Forensic", "Penetration", "Pen Test",
     "Analyst", "Systems Administrator", "Sysadmin", "IT Support", "Infrastructure"

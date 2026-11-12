@@ -18,6 +18,8 @@ E = os.environ.get
 DATA = E("DATA_DIR", "/data")
 REED_BASE = E("REED_BASE_URL", "https://www.reed.co.uk/api/1.0").rstrip("/")
 ADZUNA_BASE = E("ADZUNA_BASE_URL", "https://api.adzuna.com/v1/api").rstrip("/")
+SOLID_BASE = E("SOLID_BASE_URL", "https://solid.jobs").rstrip("/")
+HIMALAYAS_BASE = E("HIMALAYAS_BASE_URL", "https://himalayas.app").rstrip("/")
 TG_BASE = E("TELEGRAM_API_BASE", "https://api.telegram.org").rstrip("/")
 failures = 0
 
@@ -136,6 +138,23 @@ def ai():
     return "FAIL", f"AI_PROVIDER={provider!r} unknown: use ollama or mistral"
 
 
+def solidjobs(base):
+    """Free keyless Polish IT board; campaign just names our service."""
+    r = requests.get(f"{base}/public-api/offers/IT",
+                     params={"campaign": "ai-job-agent-setup-check", "pageSize": 1},
+                     headers={"X-Api-Version": "1.0"}, timeout=30)
+    r.raise_for_status()
+    return "OK", f"{r.json().get('totalCount', '?')} IT offers (free, no key)"
+
+
+def himalayas(base):
+    """Free keyless remote-jobs feed with a country filter."""
+    r = requests.get(f"{base}/jobs/api/search",
+                     params={"q": "analyst", "country": "PL", "limit": 1}, timeout=30)
+    r.raise_for_status()
+    return "OK", f"{r.json().get('totalCount', '?')} remote jobs open to Poland"
+
+
 def nocodb():
     if not (is_set("NOCODB_TOKEN") and is_set("NOCODB_TABLE_ID")):
         return "FAIL", "NOCODB_TOKEN or NOCODB_TABLE_ID not set in .env"
@@ -175,6 +194,8 @@ print("AI Job Agent - setup check")
 check("Files", files)
 check("Reed API", reed)
 check("Adzuna API", adzuna)
+check("solid.jobs API", lambda: solidjobs(SOLID_BASE))
+check("Himalayas API", lambda: himalayas(HIMALAYAS_BASE))
 check("AI provider", ai)
 check("NocoDB tracker", nocodb)
 check("Telegram", telegram)
