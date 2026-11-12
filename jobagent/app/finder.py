@@ -11,8 +11,11 @@ What this program does, in order:
   3. Removes duplicates and adverts it has already processed before.
   4. Throws away adverts that clearly do not fit (wrong title, too senior,
      or containing a "skip" phrase such as a security-clearance requirement).
-  5. Asks a local AI model (through Ollama) to score every remaining advert
-     against YOUR master profile (cv/master.md), from 0 to 100.
+  5. Asks an AI model to score every remaining advert against YOUR master
+     profile (cv/master.md), from 0 to 100. Two providers:
+       - Ollama (default): a local model on your own server, free and private
+       - Mistral:   set AI_PROVIDER=mistral and MISTRAL_API_KEY in .env to use
+                    the Mistral API instead (no GPU needed, runs anywhere)
   6. Saves every advert that scores at or above "min_match_score" into the
      NocoDB tracker table with Status = "Found".
   7. Sends you a Telegram summary of the best matches.
@@ -60,13 +63,19 @@ NOCODB_TABLE_ID = os.environ.get("NOCODB_TABLE_ID", "").strip()
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://ollama:11434").rstrip("/")
 SCORING_MODEL = os.environ.get("SCORING_MODEL", "qwen2.5:3b").strip()
 
+# --- AI provider: "ollama" (local, free) or "mistral" (API, no GPU needed) ---
+AI_PROVIDER = (os.environ.get("AI_PROVIDER", "ollama").strip().lower() or "ollama")
+MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY", "").strip()
+MISTRAL_BASE = os.environ.get("MISTRAL_BASE_URL", "https://api.mistral.ai").rstrip("/")
+
 # Base URLs can be overridden for testing; normal users never change these.
 REED_BASE = os.environ.get("REED_BASE_URL", "https://www.reed.co.uk/api/1.0").rstrip("/")
 ADZUNA_BASE = os.environ.get("ADZUNA_BASE_URL", "https://api.adzuna.com/v1/api").rstrip("/")
 TELEGRAM_BASE = os.environ.get("TELEGRAM_API_BASE", "https://api.telegram.org").rstrip("/")
 
 # AI scoring limits (explained in the handbook, chapter "AI configuration")
-AI_TIMEOUT_SECONDS = 360      # give up on one advert after 6 minutes
+AI_TIMEOUT_SECONDS = 360      # give up on one advert after 6 minutes (Ollama)
+MISTRAL_TIMEOUT_SECONDS = 60  # the Mistral API normally answers in a few seconds
 AI_NUM_CTX = 8192             # context window: master profile + advert must fit
 AI_NUM_PREDICT = 300          # max answer length; stops endless-whitespace bug
 DESCRIPTION_LIMIT = 2500      # characters of the advert sent to the AI
@@ -160,17 +169,37 @@ def parse_reed_date(value):
 # ---------------------------------------------------------------------------
 # Job sources
 # ---------------------------------------------------------------------------
+def search_countries(cfg):
+    """Countries to search, e.g. [{"code": "gb", "location": "London", "distance_miles": 20}].
+
+    Codes are Adzuna country codes ("gb", "pl", ...). Reed is UK-only and only
+    runs when "gb" is in the list. Older config files with a single top-level
+    "location" keep working: they are treated as the UK entry.
+    """
+    countries = cfg.get("search_countries") or []
+    if countries:
+        return countries
+    return [{"code": "gb", "location": cfg.get("location", ""),
+             "distance_miles": cfg.get("distance_miles", 20)}]
+
+
 def fetch_reed(cfg):
+    # Reed only lists jobs posted on reed.co.uk (UK only).
+    uk = [c for c in search_countries(cfg) if (c.get("code") or "gb").lower() == "gb"]
+    if not uk:
+        log("Reed: UK not in search_countries, skipping Reed")
+        return []
     if not is_set(REED_API_KEY):
         log("Reed: no REED_API_KEY in .env, skipping Reed")
         return []
+    country = uk[0]
     jobs = []
     oldest = dt.date.today() - dt.timedelta(days=int(cfg["max_days_old"]))
     for keyword in cfg["search_keywords"]:
         params = {"keywords": keyword, "fullTime": "true", "resultsToTake": 100}
-        if cfg["location"]:
-            params["locationName"] = cfg["location"]
-            params["distanceFromLocation"] = cfg["distance_miles"]
+        if country.get("location"):
+            params["locationName"] = country["location"]
+            params["distanceFromLocation"] = country.get("distance_miles", 20)
         try:
             r = requests.get(f"{REED_BASE}/search", params=params,
                              auth=(REED_API_KEY, ""), timeout=HTTP_TIMEOUT)
@@ -187,6 +216,7 @@ def fetch_reed(cfg):
                 "id": f"reed-{item.get('jobId')}",
                 "source": "Reed",
                 "source_job_id": item.get("jobId"),
+                "country": "GB",
                 "title": item.get("jobTitle") or "",
                 "company": item.get("employerName") or "",
                 "location": item.get("locationName") or "",
@@ -202,39 +232,43 @@ def fetch_adzuna(cfg):
         log("Adzuna: ADZUNA_APP_ID or ADZUNA_APP_KEY missing in .env, skipping Adzuna")
         return []
     jobs = []
-    for keyword in cfg["search_keywords"]:
-        params = {
-            "app_id": ADZUNA_APP_ID,
-            "app_key": ADZUNA_APP_KEY,
-            "what_phrase": keyword,
-            "full_time": 1,
-            "max_days_old": int(cfg["max_days_old"]),
-            "results_per_page": 50,
-            "content-type": "application/json",
-        }
-        if cfg["location"]:
-            params["where"] = cfg["location"]
-            params["distance"] = int(round(float(cfg["distance_miles"]) * 1.609))  # km
-        try:
-            r = requests.get(f"{ADZUNA_BASE}/jobs/gb/search/1", params=params,
-                             timeout=HTTP_TIMEOUT)
-            r.raise_for_status()
-            results = r.json().get("results", [])
-        except Exception as exc:
-            log(f"Adzuna: '{keyword}' failed: {exc}")
-            continue
-        for item in results:
-            jobs.append({
-                "id": f"adzuna-{item.get('id')}",
-                "source": "Adzuna",
-                "source_job_id": item.get("id"),
-                "title": strip_html(item.get("title") or ""),
-                "company": (item.get("company") or {}).get("display_name", ""),
-                "location": (item.get("location") or {}).get("display_name", ""),
-                "url": item.get("redirect_url") or "",
-                "description": strip_html(item.get("description") or ""),
-            })
-        log(f"Adzuna: '{keyword}' -> {len(results)} results")
+    for country in search_countries(cfg):
+        code = (country.get("code") or "gb").lower()
+        for keyword in cfg["search_keywords"]:
+            params = {
+                "app_id": ADZUNA_APP_ID,
+                "app_key": ADZUNA_APP_KEY,
+                "what_phrase": keyword,
+                "full_time": 1,
+                "max_days_old": int(cfg["max_days_old"]),
+                "results_per_page": 50,
+                "content-type": "application/json",
+            }
+            if country.get("location"):
+                params["where"] = country["location"]
+                # Adzuna expects kilometres, the config stores miles
+                params["distance"] = int(round(float(country.get("distance_miles", 20)) * 1.609))
+            try:
+                r = requests.get(f"{ADZUNA_BASE}/jobs/{code}/search/1", params=params,
+                                 timeout=HTTP_TIMEOUT)
+                r.raise_for_status()
+                results = r.json().get("results", [])
+            except Exception as exc:
+                log(f"Adzuna [{code.upper()}]: '{keyword}' failed: {exc}")
+                continue
+            for item in results:
+                jobs.append({
+                    "id": f"adzuna-{item.get('id')}",
+                    "source": "Adzuna",
+                    "source_job_id": item.get("id"),
+                    "country": code.upper(),
+                    "title": strip_html(item.get("title") or ""),
+                    "company": (item.get("company") or {}).get("display_name", ""),
+                    "location": (item.get("location") or {}).get("display_name", ""),
+                    "url": item.get("redirect_url") or "",
+                    "description": strip_html(item.get("description") or ""),
+                })
+            log(f"Adzuna [{code.upper()}]: '{keyword}' -> {len(results)} results")
     return jobs
 
 
@@ -284,9 +318,9 @@ def rule_check(job, cfg):
 
 
 # ---------------------------------------------------------------------------
-# AI scoring (Ollama)
+# AI scoring (Ollama or Mistral API - see AI_PROVIDER)
 # ---------------------------------------------------------------------------
-SYSTEM_INSTRUCTIONS = """You are an experienced UK recruiter screening job adverts for ONE candidate.
+SYSTEM_INSTRUCTIONS = """You are an experienced recruiter screening job adverts for ONE candidate.
 The candidate's complete, truthful profile is below. Judge only from facts in the profile.
 Never assume skills, experience or qualifications that the profile does not state.
 
@@ -308,30 +342,65 @@ Reply with JSON only, exactly in this shape:
 """
 
 
-def score_job(job, master):
-    # The profile goes FIRST and never changes between adverts, so Ollama can
-    # reuse it (prompt-prefix caching). Only the advert part changes.
+def build_messages(job, master):
+    """The profile goes FIRST and never changes between adverts, so Ollama can
+    reuse it (prompt-prefix caching) and Mistral's API behaves predictably."""
     system_prompt = SYSTEM_INSTRUCTIONS + master
     advert = (
         f"JOB TITLE: {job['title']}\n"
         f"COMPANY: {job['company']}\n"
+        f"COUNTRY: {job.get('country', '')}\n"
         f"LOCATION: {job['location']}\n"
         f"DESCRIPTION:\n{job['description'][:DESCRIPTION_LIMIT]}"
     )
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": advert},
+    ]
+
+
+def score_with_ollama(messages):
     payload = {
         "model": SCORING_MODEL,
         "stream": False,
         "format": "json",
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": advert},
-        ],
+        "messages": messages,
         "options": {"num_ctx": AI_NUM_CTX, "temperature": 0.1,
                     "num_predict": AI_NUM_PREDICT},
     }
     r = requests.post(f"{OLLAMA_URL}/api/chat", json=payload, timeout=AI_TIMEOUT_SECONDS)
     r.raise_for_status()
-    content = r.json().get("message", {}).get("content", "")
+    return r.json().get("message", {}).get("content", "")
+
+
+def score_with_mistral(messages):
+    if not is_set(MISTRAL_API_KEY):
+        raise RuntimeError("AI_PROVIDER=mistral but MISTRAL_API_KEY is missing in .env")
+    payload = {
+        "model": SCORING_MODEL,
+        "messages": messages,
+        "temperature": 0.1,
+        "max_tokens": AI_NUM_PREDICT,
+        "response_format": {"type": "json_object"},  # Mistral JSON mode
+    }
+    r = requests.post(
+        f"{MISTRAL_BASE}/v1/chat/completions",
+        headers={"Authorization": f"Bearer {MISTRAL_API_KEY}",
+                 "Content-Type": "application/json"},
+        json=payload, timeout=MISTRAL_TIMEOUT_SECONDS)
+    if r.status_code == 401:
+        raise RuntimeError("Mistral API key rejected (401): check MISTRAL_API_KEY")
+    if r.status_code == 429:
+        raise RuntimeError("Mistral rate limit hit (429): job will be retried next run")
+    r.raise_for_status()
+    choices = r.json().get("choices", [])
+    if not choices:
+        raise RuntimeError("Mistral returned no choices")
+    return choices[0].get("message", {}).get("content", "")
+
+
+def parse_score(content):
+    """Both providers return the same JSON answer; parse it the same way."""
     match = re.search(r"\{.*\}", content, re.S)
     if not match:
         raise ValueError(f"AI did not return JSON: {content[:120]!r}")
@@ -346,6 +415,18 @@ def score_job(job, master):
     return result
 
 
+def score_job(job, master):
+    if AI_PROVIDER not in ("ollama", "mistral"):
+        raise RuntimeError(
+            f"AI_PROVIDER={AI_PROVIDER!r} is unknown: use 'ollama' or 'mistral'")
+    messages = build_messages(job, master)
+    if AI_PROVIDER == "mistral":
+        content = score_with_mistral(messages)
+    else:
+        content = score_with_ollama(messages)
+    return parse_score(content)
+
+
 # ---------------------------------------------------------------------------
 # Outputs: NocoDB tracker and Telegram
 # ---------------------------------------------------------------------------
@@ -357,6 +438,7 @@ def save_to_nocodb(job, result):
         f"Level fit: {result['level_fit']}\n"
         f"Reasons: {'; '.join(result['reasons'])}\n"
         f"Gaps: {'; '.join(result['gaps'])}\n"
+        f"Country: {job.get('country', '')}\n"
         f"Location: {job['location']}"
     )
     record = {
@@ -415,9 +497,12 @@ def telegram_summary(matches, stats, cfg):
              f"scored {stats['scored']}", ""]
     for job, res in top:
         reason = res["reasons"][0] if res["reasons"] else ""
+        where = job["location"]
+        if job.get("country") and job["country"] not in where.upper():
+            where = f"{where}, {job['country']}" if where else job["country"]
         lines.append(f"<b>{res['score']}</b> - {e(job['title'])} @ {e(job['company'])}")
-        if job["location"]:
-            lines.append(f"   {e(job['location'])} ({e(job['source'])})")
+        if where:
+            lines.append(f"   {e(where)} ({e(job['source'])})")
         if reason:
             lines.append(f"   {e(reason)}")
         if job["url"]:
@@ -434,7 +519,8 @@ def run_once():
     cfg = load_config()
     master = load_master()
     seen = load_seen()
-    log(f"Run started (model {SCORING_MODEL}, threshold {cfg['min_match_score']})")
+    log(f"Run started (AI_PROVIDER {AI_PROVIDER}, model {SCORING_MODEL}, "
+        f"threshold {cfg['min_match_score']})")
 
     jobs = dedupe(fetch_reed(cfg) + fetch_adzuna(cfg))
     fetched = len(jobs)

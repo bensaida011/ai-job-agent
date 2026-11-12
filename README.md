@@ -6,12 +6,21 @@
 
 **Download the install package:** [ai-job-agent.zip (latest release)](../../releases/latest)
 
-A self-hosted assistant that searches UK job boards twice a day, scores every
-advert against your own profile with a local AI model, saves the good matches
+A self-hosted assistant that searches job boards (UK via Reed + Adzuna, other
+countries such as Poland via Adzuna) twice a day, scores every
+advert against your own profile with an AI model, saves the good matches
 to a tracker and sends you a Telegram summary.
 
-It runs on an old laptop or mini PC (Proxmox + one Linux container + Docker)
-and needs no graphics card and no paid AI service.
+Scoring runs on a local Ollama model by default (free, private, no GPU-heavy
+requirements needed beyond a modest machine). Alternatively set
+`AI_PROVIDER=mistral` in `.env` to score with the Mistral API instead — no
+local AI stack needed at all, at the cost of sending job advert text to
+Mistral's servers.
+
+It runs on an old laptop or mini PC (Proxmox + one Linux container + Docker).
+With Ollama it needs no graphics card and no paid AI service; with the
+Mistral provider it works on even smaller machines but needs internet access
+and a Mistral API key.
 
 > **What it does NOT do (yet):** it does not rewrite your CV, does not ask for
 > approval and does not apply for jobs. Those are planned parts 2-4. You apply
@@ -91,9 +100,27 @@ Then:
 | 5678 | n8n | optional, `--profile extras` |
 | 11434 | Ollama | bound to 127.0.0.1 only (no password) |
 
+## Switching the AI: Ollama (default) or Mistral API
+
+Scoring is pluggable via `.env` (`/opt/stacks/jobagent/.env`):
+
+| | Ollama | Mistral API |
+|---|---|---|
+| Set | `AI_PROVIDER=ollama` | `AI_PROVIDER=mistral` |
+| Model examples | `qwen2.5:3b`, `llama3.1:8b` | `mistral-small-latest`, `open-mistral-nemo` |
+| Extra secret needed | none (`OLLAMA_URL`) | `MISTRAL_API_KEY` from [console.mistral.ai](https://console.mistral.ai) |
+| Runs on | your server (AI stack) | Mistral's cloud (nothing local) |
+| Privacy | adverts never leave your server | advert text is sent to Mistral |
+
+`SCORING_MODEL` must match the active provider. After switching, run
+`cd /opt/stacks/jobagent && docker compose up -d --force-recreate` and then
+`docker exec jobagent python /data/tools/check_setup.py` to verify the
+provider. When `mistral` is active, the Ollama stack (AI stack) is optional.
+
 ## Security
 
-* Never share, screenshot or commit `/opt/stacks/jobagent/.env`.
+* Never share, screenshot or commit `/opt/stacks/jobagent/.env` (this includes
+  `MISTRAL_API_KEY`).
 * Do not expose any of these ports to the internet; use Tailscale for remote access.
 * The AI may only rephrase what is in `master.md`; it must never invent experience.
 * Any future auto-apply feature must ask for approval for every application.
