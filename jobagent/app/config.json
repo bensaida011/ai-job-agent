@@ -19,6 +19,9 @@
   "solidjobs_enabled": true,
   "solidjobs_campaign": "ai-job-agent",
   "himalayas_enabled": true,
+  "jooble_enabled": true,
+  "justjoin_enabled": true,
+  "justjoin_max_results": 100,
   "title_must_contain_one_of": [
     "SOC", "Security", "Cyber", "Forensic", "Penetration", "Pen Test",
     "Analyst", "Systems Administrator", "Sysadmin", "IT Support", "Infrastructure"

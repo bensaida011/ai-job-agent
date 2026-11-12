@@ -9,7 +9,10 @@ What this program does, in order:
      (or runs immediately when started with --once).
   2. Downloads fresh job adverts from Reed (UK), Adzuna (many countries,
      including Poland) and the free solid.jobs and Himalayas APIs
-     (Polish IT board and remote roles).
+     (Polish IT board and remote roles), plus two extra Polish sources:
+     Jooble (free partner key, aggregates pracuj.pl and other Polish
+     boards) and JustJoin.it (Poland's biggest IT board, listings in
+     English, via a paid-per-job Apify scraper).
   3. Removes duplicates and adverts it has already processed before.
   4. Throws away adverts that clearly do not fit (wrong title, too senior,
      or containing a "skip" phrase such as a security-clearance requirement).
@@ -57,6 +60,8 @@ SEEN_FILE = os.path.join(DATA_DIR, "state", "seen.json")
 REED_API_KEY = os.environ.get("REED_API_KEY", "").strip()
 ADZUNA_APP_ID = os.environ.get("ADZUNA_APP_ID", "").strip()
 ADZUNA_APP_KEY = os.environ.get("ADZUNA_APP_KEY", "").strip()
+JOOBLE_API_KEY = os.environ.get("JOOBLE_API_KEY", "").strip()
+APIFY_API_TOKEN = os.environ.get("APIFY_API_TOKEN", "").strip()
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 NOCODB_URL = os.environ.get("NOCODB_URL", "http://nocodb:8080").rstrip("/")
@@ -75,6 +80,10 @@ REED_BASE = os.environ.get("REED_BASE_URL", "https://www.reed.co.uk/api/1.0").rs
 ADZUNA_BASE = os.environ.get("ADZUNA_BASE_URL", "https://api.adzuna.com/v1/api").rstrip("/")
 SOLID_BASE = os.environ.get("SOLID_BASE_URL", "https://solid.jobs").rstrip("/")
 HIMALAYAS_BASE = os.environ.get("HIMALAYAS_BASE_URL", "https://himalayas.app").rstrip("/")
+JOOBLE_BASE = os.environ.get("JOOBLE_BASE_URL", "https://jooble.org").rstrip("/")
+APIFY_BASE = os.environ.get("APIFY_BASE_URL", "https://api.apify.com/v2").rstrip("/")
+# Apify actor IDs use "~" between owner and name, not "/".
+JUSTJOIN_ACTOR_ID = os.environ.get("JUSTJOIN_ACTOR_ID", "unfenced-group~justjoin-scraper")
 TELEGRAM_BASE = os.environ.get("TELEGRAM_API_BASE", "https://api.telegram.org").rstrip("/")
 
 # AI scoring limits (explained in the handbook, chapter "AI configuration")
@@ -109,6 +118,10 @@ def load_config():
     cfg.setdefault("solidjobs_enabled", True)
     cfg.setdefault("solidjobs_campaign", "ai-job-agent")
     cfg.setdefault("himalayas_enabled", True)
+    cfg.setdefault("jooble_enabled", True)
+    cfg.setdefault("justjoin_enabled", True)
+    # Apify bills per returned job (about $0.001 each): keep a per-run cap.
+    cfg.setdefault("justjoin_max_results", 100)
     cfg.setdefault("location", "")
     cfg.setdefault("distance_miles", 20)
     cfg.setdefault("title_must_contain_one_of", [])
@@ -410,6 +423,136 @@ def fetch_himalayas(cfg):
     return jobs
 
 
+def fetch_jooble(cfg):
+    """Jooble - free partner API that aggregates Polish boards (pracuj.pl,
+    OLX Praca and others), so it reaches adverts the other sources miss.
+
+    Request a key at https://jooble.org/api (one short form, key by email).
+    NOTE: results carry only a short snippet, like Reed - the AI scores on
+    that snippet, so treat Jooble scores as a first sift.
+    """
+    countries = search_countries(cfg)
+    if not any((c.get("code") or "gb").lower() == "pl" for c in countries):
+        log("Jooble: PL not in search_countries, skipping Jooble")
+        return []
+    if not cfg.get("jooble_enabled", True):
+        log("Jooble: disabled (jooble_enabled = false), skipping")
+        return []
+    if not is_set(JOOBLE_API_KEY):
+        log("Jooble: no JOOBLE_API_KEY in .env, skipping Jooble")
+        return []
+    pl = [c for c in countries if (c.get("code") or "gb").lower() == "pl"][0]
+    oldest = dt.date.today() - dt.timedelta(days=int(cfg["max_days_old"]))
+    jobs = []
+    for keyword in cfg["search_keywords"]:
+        payload = {"keywords": keyword, "page": 1,
+                   "location": pl.get("location") or "Poland"}
+        try:
+            r = requests.post(f"{JOOBLE_BASE}/api/{JOOBLE_API_KEY}", json=payload,
+                              timeout=HTTP_TIMEOUT)
+            if r.status_code in (401, 403):
+                log(f"Jooble: key rejected ({r.status_code}): check JOOBLE_API_KEY")
+                return jobs
+            r.raise_for_status()
+            results = r.json().get("jobs", [])
+        except Exception as exc:  # one bad keyword must not stop the run
+            log(f"Jooble: '{keyword}' failed: {exc}")
+            continue
+        kept = 0
+        for item in results:
+            posted = parse_iso_date(item.get("updated"))
+            if posted and posted < oldest:
+                continue
+            jobs.append({
+                "id": f"jooble-{item.get('id')}",
+                "source": "Jooble",
+                "source_job_id": item.get("id"),
+                "country": "PL",
+                "title": strip_html(item.get("title") or ""),
+                "company": item.get("company") or "",
+                "location": item.get("location") or "",
+                "url": item.get("link") or "",
+                "description": strip_html(item.get("snippet") or ""),
+            })
+            kept += 1
+        log(f"Jooble: '{keyword}' -> {len(results)} results, {kept} fresh")
+    return jobs
+
+
+def _justjoin_field(item, *names):
+    """The Apify actor's output field names are not covered by a stable
+    contract, so accept several common variants and fall back to ''."""
+    for name in names:
+        value = item.get(name)
+        if value:
+            return value
+    return ""
+
+
+def fetch_justjoin(cfg):
+    """JustJoin.it - Poland's biggest IT board; the site and nearly all
+    listings are in English, ideal for non-Polish-speaking researchers.
+
+    JustJoin has no official API, so this runs the 'justjoin-scraper'
+    Apify actor synchronously and reads its dataset items. Apify bills
+    per returned job (about $0.001 each): the justjoin_max_results
+    setting caps the spend per keyword.
+    """
+    countries = search_countries(cfg)
+    if not any((c.get("code") or "gb").lower() == "pl" for c in countries):
+        log("JustJoin: PL not in search_countries, skipping JustJoin")
+        return []
+    if not cfg.get("justjoin_enabled", True):
+        log("JustJoin: disabled (justjoin_enabled = false), skipping")
+        return []
+    if not is_set(APIFY_API_TOKEN):
+        log("JustJoin: no APIFY_API_TOKEN in .env, skipping JustJoin")
+        return []
+    limit = int(cfg.get("justjoin_max_results", 100))
+    jobs = []
+    for keyword in cfg["search_keywords"]:
+        try:
+            r = requests.post(
+                f"{APIFY_BASE}/acts/{JUSTJOIN_ACTOR_ID}/run-sync-get-dataset-items",
+                params={"token": APIFY_API_TOKEN, "timeout": 300},
+                json={"searchQuery": keyword, "maxResults": limit},
+                timeout=310)  # scraping 100 jobs can take a few minutes
+            if r.status_code in (401, 403):
+                log(f"JustJoin: Apify token rejected ({r.status_code}): "
+                    f"check APIFY_API_TOKEN")
+                return jobs
+            if r.status_code == 404:
+                log(f"JustJoin: actor {JUSTJOIN_ACTOR_ID} not found "
+                    f"(404): check JUSTJOIN_ACTOR_ID")
+                return jobs
+            r.raise_for_status()
+            results = r.json()
+            if not isinstance(results, list):
+                raise ValueError(f"expected a list, got {type(results).__name__}")
+        except Exception as exc:  # one bad keyword must not stop the run
+            log(f"JustJoin: '{keyword}' failed: {exc}")
+            continue
+        for item in results:
+            company = _justjoin_field(item, "company", "companyName",
+                                      "employerName", "company_name")
+            job_id = _justjoin_field(item, "id", "offerId", "slug", "title")
+            jobs.append({
+                "id": f"justjoin-{norm(str(job_id))[:80]}",
+                "source": "JustJoin",
+                "source_job_id": job_id,
+                "country": "PL",
+                "title": strip_html(_justjoin_field(item, "title", "name", "jobTitle")),
+                "company": strip_html(company if isinstance(company, str) else ""),
+                "location": strip_html(_justjoin_field(item, "city", "location",
+                                                      "workplace")),
+                "url": _justjoin_field(item, "url", "link", "jobUrl"),
+                "description": strip_html(_justjoin_field(
+                    item, "description", "desc", "jobDescription")),
+            })
+        log(f"JustJoin: '{keyword}' -> {len(results)} results")
+    return jobs
+
+
 # ---------------------------------------------------------------------------
 # Filtering
 # ---------------------------------------------------------------------------
@@ -647,7 +790,8 @@ def run_once():
         f"threshold {cfg['min_match_score']})")
 
     jobs = dedupe(fetch_reed(cfg) + fetch_adzuna(cfg)
-                  + fetch_solidjobs(cfg) + fetch_himalayas(cfg))
+                  + fetch_solidjobs(cfg) + fetch_himalayas(cfg)
+                  + fetch_jooble(cfg) + fetch_justjoin(cfg))
     fetched = len(jobs)
     jobs = [j for j in jobs if j["id"] not in seen]
     log(f"Fetched {fetched} unique jobs, {len(jobs)} not seen before")

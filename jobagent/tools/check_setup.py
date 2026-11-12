@@ -20,6 +20,9 @@ REED_BASE = E("REED_BASE_URL", "https://www.reed.co.uk/api/1.0").rstrip("/")
 ADZUNA_BASE = E("ADZUNA_BASE_URL", "https://api.adzuna.com/v1/api").rstrip("/")
 SOLID_BASE = E("SOLID_BASE_URL", "https://solid.jobs").rstrip("/")
 HIMALAYAS_BASE = E("HIMALAYAS_BASE_URL", "https://himalayas.app").rstrip("/")
+JOOBLE_BASE = E("JOOBLE_BASE_URL", "https://jooble.org").rstrip("/")
+APIFY_BASE = E("APIFY_BASE_URL", "https://api.apify.com/v2").rstrip("/")
+APIFY_ACTOR = E("JUSTJOIN_ACTOR_ID", "unfenced-group~justjoin-scraper")
 TG_BASE = E("TELEGRAM_API_BASE", "https://api.telegram.org").rstrip("/")
 failures = 0
 
@@ -155,6 +158,33 @@ def himalayas(base):
     return "OK", f"{r.json().get('totalCount', '?')} remote jobs open to Poland"
 
 
+def jooble():
+    """Free partner API aggregating Polish boards; key from jooble.org/api."""
+    if not is_set("JOOBLE_API_KEY"):
+        return "SKIP", "not configured (optional)"
+    r = requests.post(f"{JOOBLE_BASE}/api/{E('JOOBLE_API_KEY').strip()}",
+                      json={"keywords": "analyst", "location": "Poland", "page": 1},
+                      timeout=30)
+    if r.status_code in (401, 403):
+        return "FAIL", "key rejected: request a new one at jooble.org/api"
+    r.raise_for_status()
+    total = r.json().get("totalCount", "?")
+    return "OK", f"{total} jobs found for 'analyst' in Poland"
+
+
+def justjoin():
+    """JustJoin.it via a paid Apify actor; only checks the token here so
+    the setup check never spends money on a scraping run."""
+    if not is_set("APIFY_API_TOKEN"):
+        return "SKIP", "not configured (optional)"
+    r = requests.get(f"{APIFY_BASE}/users/me",
+                     params={"token": E("APIFY_API_TOKEN").strip()}, timeout=30)
+    if r.status_code in (401, 403):
+        return "FAIL", "token rejected: copy it again from console.apify.com"
+    r.raise_for_status()
+    return "OK", "Apify token valid (actor bills ~$0.001 per job)"
+
+
 def nocodb():
     if not (is_set("NOCODB_TOKEN") and is_set("NOCODB_TABLE_ID")):
         return "FAIL", "NOCODB_TOKEN or NOCODB_TABLE_ID not set in .env"
@@ -196,6 +226,8 @@ check("Reed API", reed)
 check("Adzuna API", adzuna)
 check("solid.jobs API", lambda: solidjobs(SOLID_BASE))
 check("Himalayas API", lambda: himalayas(HIMALAYAS_BASE))
+check("Jooble API", jooble)
+check("JustJoin (Apify)", justjoin)
 check("AI provider", ai)
 check("NocoDB tracker", nocodb)
 check("Telegram", telegram)
